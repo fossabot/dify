@@ -1,7 +1,12 @@
-from collections.abc import Generator
+import json
+import time
 from typing import Optional, Union
 
+from core.workflow.callbacks.base_callback import BaseWorkflowCallback
 from core.workflow.entities.node_entities import NodeType
+from core.workflow.entities.variable_pool import VariablePool
+from core.workflow.entities.workflow_entities import WorkflowRunState
+from core.workflow.nodes.base_node import BaseNode
 from core.workflow.nodes.code.code_node import CodeNode
 from core.workflow.nodes.direct_answer.direct_answer_node import DirectAnswerNode
 from core.workflow.nodes.end.end_node import EndNode
@@ -17,7 +22,16 @@ from core.workflow.nodes.variable_assigner.variable_assigner_node import Variabl
 from extensions.ext_database import db
 from models.account import Account
 from models.model import App, EndUser
-from models.workflow import Workflow
+from models.workflow import (
+    CreatedByRole,
+    Workflow,
+    WorkflowNodeExecution,
+    WorkflowNodeExecutionStatus,
+    WorkflowNodeExecutionTriggeredFrom,
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowRunTriggeredFrom,
+)
 
 node_classes = {
     NodeType.START: StartNode,
@@ -108,17 +122,265 @@ class WorkflowEngineManager:
 
     def run_workflow(self, app_model: App,
                      workflow: Workflow,
+                     triggered_from: WorkflowRunTriggeredFrom,
                      user: Union[Account, EndUser],
                      user_inputs: dict,
-                     system_inputs: Optional[dict] = None) -> Generator:
+                     system_inputs: Optional[dict] = None,
+                     callbacks: list[BaseWorkflowCallback] = None) -> None:
         """
         Run workflow
         :param app_model: App instance
         :param workflow: Workflow instance
+        :param triggered_from: triggered from
+        :param user: account or end user
+        :param user_inputs: user variables inputs
+        :param system_inputs: system inputs, like: query, files
+        :param callbacks: workflow callbacks
+        :return:
+        """
+        # fetch workflow graph
+        graph = workflow.graph_dict
+        if not graph:
+            raise ValueError('workflow graph not found')
+
+        # init workflow run
+        workflow_run = self._init_workflow_run(
+            workflow=workflow,
+            triggered_from=triggered_from,
+            user=user,
+            user_inputs=user_inputs,
+            system_inputs=system_inputs
+        )
+
+        # init workflow run state
+        workflow_run_state = WorkflowRunState(
+            workflow_run=workflow_run,
+            start_at=time.perf_counter(),
+            variable_pool=VariablePool(
+                system_variables=system_inputs,
+            )
+        )
+
+        if callbacks:
+            for callback in callbacks:
+                callback.on_workflow_run_started(workflow_run)
+
+        # fetch start node
+        start_node = self._get_entry_node(graph)
+        if not start_node:
+            self._workflow_run_failed(
+                workflow_run_state=workflow_run_state,
+                error='Start node not found in workflow graph',
+                callbacks=callbacks
+            )
+            return
+
+        try:
+            predecessor_node = None
+            current_node = start_node
+            while True:
+                # run workflow
+                self._run_workflow_node(
+                    workflow_run_state=workflow_run_state,
+                    node=current_node,
+                    predecessor_node=predecessor_node,
+                    callbacks=callbacks
+                )
+
+                if current_node.node_type == NodeType.END:
+                    break
+
+                # todo fetch next node until end node finished or no next node
+                current_node = None
+
+                if not current_node:
+                    break
+
+                predecessor_node = current_node
+                # or max steps 30 reached
+                # or max execution time 10min reached
+        except Exception as e:
+            self._workflow_run_failed(
+                workflow_run_state=workflow_run_state,
+                error=str(e),
+                callbacks=callbacks
+            )
+            return
+
+        # workflow run success
+        self._workflow_run_success(
+            workflow_run_state=workflow_run_state,
+            callbacks=callbacks
+        )
+
+    def _init_workflow_run(self, workflow: Workflow,
+                           triggered_from: WorkflowRunTriggeredFrom,
+                           user: Union[Account, EndUser],
+                           user_inputs: dict,
+                           system_inputs: Optional[dict] = None) -> WorkflowRun:
+        """
+        Init workflow run
+        :param workflow: Workflow instance
+        :param triggered_from: triggered from
         :param user: account or end user
         :param user_inputs: user variables inputs
         :param system_inputs: system inputs, like: query, files
         :return:
         """
-        # TODO
-        pass
+        try:
+            db.session.begin()
+
+            max_sequence = db.session.query(db.func.max(WorkflowRun.sequence_number)) \
+                               .filter(WorkflowRun.tenant_id == workflow.tenant_id) \
+                               .filter(WorkflowRun.app_id == workflow.app_id) \
+                               .for_update() \
+                               .scalar() or 0
+            new_sequence_number = max_sequence + 1
+
+            # init workflow run
+            workflow_run = WorkflowRun(
+                tenant_id=workflow.tenant_id,
+                app_id=workflow.app_id,
+                sequence_number=new_sequence_number,
+                workflow_id=workflow.id,
+                type=workflow.type,
+                triggered_from=triggered_from.value,
+                version=workflow.version,
+                graph=workflow.graph,
+                inputs=json.dumps({**user_inputs, **system_inputs}),
+                status=WorkflowRunStatus.RUNNING.value,
+                created_by_role=(CreatedByRole.ACCOUNT.value
+                                 if isinstance(user, Account) else CreatedByRole.END_USER.value),
+                created_by=user.id
+            )
+
+            db.session.add(workflow_run)
+            db.session.commit()
+        except:
+            db.session.rollback()
+            raise
+
+        return workflow_run
+
+    def _workflow_run_failed(self, workflow_run_state: WorkflowRunState,
+                             error: str,
+                             callbacks: list[BaseWorkflowCallback] = None) -> WorkflowRun:
+        """
+        Workflow run failed
+        :param workflow_run_state: workflow run state
+        :param error: error message
+        :param callbacks: workflow callbacks
+        :return:
+        """
+        workflow_run = workflow_run_state.workflow_run
+        workflow_run.status = WorkflowRunStatus.FAILED.value
+        workflow_run.error = error
+        workflow_run.elapsed_time = time.perf_counter() - workflow_run_state.start_at
+        workflow_run.total_tokens = workflow_run_state.total_tokens
+        workflow_run.total_price = workflow_run_state.total_price
+        workflow_run.currency = workflow_run_state.currency
+        workflow_run.total_steps = len(workflow_run_state.workflow_node_executions)
+
+        db.session.commit()
+
+        if callbacks:
+            for callback in callbacks:
+                callback.on_workflow_run_finished(workflow_run)
+
+        return workflow_run
+
+    def _get_entry_node(self, graph: dict) -> Optional[StartNode]:
+        """
+        Get entry node
+        :param graph: workflow graph
+        :return:
+        """
+        nodes = graph.get('nodes')
+        if not nodes:
+            return None
+
+        for node_config in nodes.items():
+            if node_config.get('type') == NodeType.START.value:
+                return StartNode(config=node_config)
+
+        return None
+
+    def _run_workflow_node(self, workflow_run_state: WorkflowRunState,
+                           node: BaseNode,
+                           predecessor_node: Optional[BaseNode] = None,
+                           callbacks: list[BaseWorkflowCallback] = None) -> WorkflowNodeExecution:
+        # init workflow node execution
+        start_at = time.perf_counter()
+        workflow_node_execution = self._init_node_execution_from_workflow_run(
+            workflow_run_state=workflow_run_state,
+            node=node,
+            predecessor_node=predecessor_node,
+        )
+
+        # add to workflow node executions
+        workflow_run_state.workflow_node_executions.append(workflow_node_execution)
+
+        try:
+            # run node, result must have inputs, process_data, outputs, execution_metadata
+            node_run_result = node.run(
+                variable_pool=workflow_run_state.variable_pool,
+                callbacks=callbacks
+            )
+        except Exception as e:
+            # node run failed
+            self._workflow_node_execution_failed(
+                workflow_node_execution=workflow_node_execution,
+                error=str(e),
+                callbacks=callbacks
+            )
+            raise
+
+        # node run success
+        self._workflow_node_execution_success(
+            workflow_node_execution=workflow_node_execution,
+            result=node_run_result,
+            callbacks=callbacks
+        )
+
+        return workflow_node_execution
+
+    def _init_node_execution_from_workflow_run(self, workflow_run_state: WorkflowRunState,
+                                               node: BaseNode,
+                                               predecessor_node: Optional[BaseNode] = None,
+                                               callbacks: list[BaseWorkflowCallback] = None) -> WorkflowNodeExecution:
+        """
+        Init workflow node execution from workflow run
+        :param workflow_run_state: workflow run state
+        :param node: current node
+        :param predecessor_node: predecessor node if exists
+        :param callbacks: workflow callbacks
+        :return:
+        """
+        workflow_run = workflow_run_state.workflow_run
+
+        # init workflow node execution
+        workflow_node_execution = WorkflowNodeExecution(
+            tenant_id=workflow_run.tenant_id,
+            app_id=workflow_run.app_id,
+            workflow_id=workflow_run.workflow_id,
+            triggered_from=WorkflowNodeExecutionTriggeredFrom.WORKFLOW_RUN.value,
+            workflow_run_id=workflow_run.id,
+            predecessor_node_id=predecessor_node.node_id if predecessor_node else None,
+            index=len(workflow_run_state.workflow_node_executions) + 1,
+            node_id=node.node_id,
+            node_type=node.node_type.value,
+            title=node.node_data.title,
+            type=node.node_type.value,
+            status=WorkflowNodeExecutionStatus.RUNNING.value,
+            created_by_role=workflow_run.created_by_role,
+            created_by=workflow_run.created_by
+        )
+
+        db.session.add(workflow_node_execution)
+        db.session.commit()
+
+        if callbacks:
+            for callback in callbacks:
+                callback.on_workflow_node_execute_started(workflow_node_execution)
+
+        return workflow_node_execution
