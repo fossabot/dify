@@ -28,6 +28,9 @@ from models.model import Conversation, Message
 
 
 class CotAgentRunner(BaseAgentRunner):
+    _is_first_iteration = True
+    _ignore_observation_providers = ['wenxin']
+
     def run(self, conversation: Conversation,
         message: Message,
         query: str,
@@ -43,9 +46,8 @@ class CotAgentRunner(BaseAgentRunner):
         self._init_agent_scratchpad(agent_scratchpad, self.history_prompt_messages)
 
         # check model mode
-        if app_generate_entity.model_config.mode == "completion":
-            # TODO: stop words
-            if 'Observation' not in app_generate_entity.model_config.stop:
+        if 'Observation' not in app_generate_entity.model_config.stop:
+            if app_generate_entity.model_config.provider not in self._ignore_observation_providers:
                 app_generate_entity.model_config.stop.append('Observation')
 
         app_config = self.app_config
@@ -204,6 +206,7 @@ class CotAgentRunner(BaseAgentRunner):
                         )
                     )
 
+            scratchpad.thought = scratchpad.thought.strip() or 'I am thinking about how to help you'
             agent_scratchpad.append(scratchpad)
                         
             # get llm usage
@@ -257,9 +260,15 @@ class CotAgentRunner(BaseAgentRunner):
                         # invoke tool
                         error_response = None
                         try:
+                            if isinstance(tool_call_args, str):
+                                try:
+                                    tool_call_args = json.loads(tool_call_args)
+                                except json.JSONDecodeError:
+                                    pass
+
                             tool_response = tool_instance.invoke(
                                 user_id=self.user_id, 
-                                tool_parameters=tool_call_args if isinstance(tool_call_args, dict) else json.loads(tool_call_args)
+                                tool_parameters=tool_call_args
                             )
                             # transform tool response to llm friendly response
                             tool_response = self.transform_tool_invoke_messages(tool_response)
@@ -468,7 +477,7 @@ class CotAgentRunner(BaseAgentRunner):
             if isinstance(message, AssistantPromptMessage):
                 current_scratchpad = AgentScratchpadUnit(
                     agent_response=message.content,
-                    thought=message.content,
+                    thought=message.content or 'I am thinking about how to help you',
                     action_str='',
                     action=None,
                     observation=None,
@@ -548,7 +557,8 @@ class CotAgentRunner(BaseAgentRunner):
 
         result = ''
         for scratchpad in agent_scratchpad:
-            result += scratchpad.thought + next_iteration.replace("{{observation}}", scratchpad.observation or '') + "\n"
+            result += (scratchpad.thought or '') + (scratchpad.action_str or '') + \
+                next_iteration.replace("{{observation}}", scratchpad.observation or 'It seems that no response is available')
 
         return result
     
@@ -623,21 +633,24 @@ class CotAgentRunner(BaseAgentRunner):
                 ))
 
             # add assistant message
-            if len(agent_scratchpad) > 0:
+            if len(agent_scratchpad) > 0 and not self._is_first_iteration:
                 prompt_messages.append(AssistantPromptMessage(
-                    content=(agent_scratchpad[-1].thought or '')
+                    content=(agent_scratchpad[-1].thought or '') + (agent_scratchpad[-1].action_str or ''),
                 ))
             
             # add user message
-            if len(agent_scratchpad) > 0:
+            if len(agent_scratchpad) > 0 and not self._is_first_iteration:
                 prompt_messages.append(UserPromptMessage(
-                    content=(agent_scratchpad[-1].observation or ''),
+                    content=(agent_scratchpad[-1].observation or 'It seems that no response is available'),
                 ))
+
+            self._is_first_iteration = False
 
             return prompt_messages
         elif mode == "completion":
             # parse agent scratchpad
             agent_scratchpad_str = self._convert_scratchpad_list_to_str(agent_scratchpad)
+            self._is_first_iteration = False
             # parse prompt messages
             return [UserPromptMessage(
                 content=first_prompt.replace("{{instruction}}", instruction)

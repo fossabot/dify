@@ -74,6 +74,7 @@ class TextApi(WebApiResource):
                 app_model=app_model,
                 text=request.form['text'],
                 end_user=end_user.external_user_id,
+                voice=request.form.get('voice'),
                 streaming=False
             )
 
