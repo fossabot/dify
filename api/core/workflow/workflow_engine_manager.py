@@ -3,6 +3,7 @@ import time
 from datetime import datetime
 from typing import Optional, Union
 
+from core.model_runtime.utils.encoders import jsonable_encoder
 from core.workflow.callbacks.base_workflow_callback import BaseWorkflowCallback
 from core.workflow.entities.node_entities import NodeRunResult, NodeType
 from core.workflow.entities.variable_pool import VariablePool, VariableValue
@@ -32,7 +33,6 @@ from models.workflow import (
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunTriggeredFrom,
-    WorkflowType,
 )
 
 node_classes = {
@@ -52,30 +52,6 @@ node_classes = {
 
 
 class WorkflowEngineManager:
-    def get_draft_workflow(self, app_model: App) -> Optional[Workflow]:
-        """
-        Get draft workflow
-        """
-        # fetch draft workflow by app_model
-        workflow = db.session.query(Workflow).filter(
-            Workflow.tenant_id == app_model.tenant_id,
-            Workflow.app_id == app_model.id,
-            Workflow.version == 'draft'
-        ).first()
-
-        # return draft workflow
-        return workflow
-
-    def get_published_workflow(self, app_model: App) -> Optional[Workflow]:
-        """
-        Get published workflow
-        """
-        if not app_model.workflow_id:
-            return None
-
-        # fetch published workflow by workflow_id
-        return self.get_workflow(app_model, app_model.workflow_id)
-
     def get_workflow(self, app_model: App, workflow_id: str) -> Optional[Workflow]:
         """
         Get workflow
@@ -166,13 +142,11 @@ class WorkflowEngineManager:
         workflow_run_state = WorkflowRunState(
             workflow_run=workflow_run,
             start_at=time.perf_counter(),
+            user_inputs=user_inputs,
             variable_pool=VariablePool(
                 system_variables=system_inputs,
             )
         )
-
-        # fetch predecessor node ids before end node (include: llm, direct answer)
-        streamable_node_ids = self._fetch_streamable_node_ids(workflow, graph)
 
         try:
             predecessor_node = None
@@ -186,10 +160,6 @@ class WorkflowEngineManager:
 
                 if not next_node:
                     break
-
-                # check if node is streamable
-                if next_node.node_id in streamable_node_ids:
-                    next_node.stream_output_supported = True
 
                 # max steps 30 reached
                 if len(workflow_run_state.workflow_node_executions) > 30:
@@ -232,34 +202,6 @@ class WorkflowEngineManager:
             workflow_run_state=workflow_run_state,
             callbacks=callbacks
         )
-
-    def _fetch_streamable_node_ids(self, workflow: Workflow, graph: dict) -> list[str]:
-        """
-        Fetch streamable node ids
-        When the Workflow type is chat, only the nodes before END Node are LLM or Direct Answer can be streamed output
-        When the Workflow type is workflow, only the nodes before END Node (only Plain Text mode) are LLM can be streamed output
-
-        :param workflow: Workflow instance
-        :param graph: workflow graph
-        :return:
-        """
-        workflow_type = WorkflowType.value_of(workflow.type)
-
-        streamable_node_ids = []
-        end_node_ids = []
-        for node_config in graph.get('nodes'):
-            if node_config.get('type') == NodeType.END.value:
-                if workflow_type == WorkflowType.WORKFLOW:
-                    if node_config.get('data', {}).get('outputs', {}).get('type', '') == 'plain-text':
-                        end_node_ids.append(node_config.get('id'))
-                else:
-                    end_node_ids.append(node_config.get('id'))
-
-        for edge_config in graph.get('edges'):
-            if edge_config.get('target') in end_node_ids:
-                streamable_node_ids.append(edge_config.get('source'))
-
-        return streamable_node_ids
 
     def _init_workflow_run(self, workflow: Workflow,
                            triggered_from: WorkflowRunTriggeredFrom,
@@ -440,7 +382,6 @@ class WorkflowEngineManager:
         :param max_execution_time: max execution time
         :return:
         """
-        # TODO check queue is stopped
         return time.perf_counter() - start_at > max_execution_time
 
     def _run_workflow_node(self, workflow_run_state: WorkflowRunState,
@@ -460,7 +401,9 @@ class WorkflowEngineManager:
 
         # run node, result must have inputs, process_data, outputs, execution_metadata
         node_run_result = node.run(
-            variable_pool=workflow_run_state.variable_pool
+            variable_pool=workflow_run_state.variable_pool,
+            run_args=workflow_run_state.user_inputs
+            if (not predecessor_node and node.node_type == NodeType.START) else None  # only on start node
         )
 
         if node_run_result.status == WorkflowNodeExecutionStatus.FAILED:
@@ -553,7 +496,7 @@ class WorkflowEngineManager:
         workflow_node_execution.inputs = json.dumps(result.inputs)
         workflow_node_execution.process_data = json.dumps(result.process_data)
         workflow_node_execution.outputs = json.dumps(result.outputs)
-        workflow_node_execution.execution_metadata = json.dumps(result.metadata)
+        workflow_node_execution.execution_metadata = json.dumps(jsonable_encoder(result.metadata))
         workflow_node_execution.finished_at = datetime.utcnow()
 
         db.session.commit()
