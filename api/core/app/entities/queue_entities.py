@@ -48,7 +48,7 @@ class QueueTextChunkEvent(AppQueueEvent):
     QueueTextChunkEvent entity
     """
     event = QueueEvent.TEXT_CHUNK
-    chunk_text: str
+    text: str
 
 
 class QueueAgentMessageEvent(AppQueueEvent):
@@ -176,7 +176,20 @@ class QueueMessage(BaseModel):
     QueueMessage entity
     """
     task_id: str
-    message_id: str
-    conversation_id: str
     app_mode: str
     event: AppQueueEvent
+
+
+class MessageQueueMessage(QueueMessage):
+    """
+    MessageQueueMessage entity
+    """
+    message_id: str
+    conversation_id: str
+
+
+class WorkflowQueueMessage(QueueMessage):
+    """
+    WorkflowQueueMessage entity
+    """
+    pass

@@ -47,6 +47,7 @@ class TaskState(BaseModel):
     answer: str = ""
     metadata: dict = {}
     usage: LLMUsage
+    workflow_run_id: Optional[str] = None
 
 
 class AdvancedChatAppGenerateTaskPipeline:
@@ -110,6 +111,8 @@ class AdvancedChatAppGenerateTaskPipeline:
                     }
 
                     self._task_state.answer = annotation.content
+            elif isinstance(event, QueueWorkflowStartedEvent):
+                self._task_state.workflow_run_id = event.workflow_run_id
             elif isinstance(event, QueueNodeFinishedEvent):
                 workflow_node_execution = self._get_workflow_node_execution(event.workflow_node_execution_id)
                 if workflow_node_execution.status == WorkflowNodeExecutionStatus.SUCCEEDED.value:
@@ -171,6 +174,7 @@ class AdvancedChatAppGenerateTaskPipeline:
                 break
             elif isinstance(event, QueueWorkflowStartedEvent):
                 workflow_run = self._get_workflow_run(event.workflow_run_id)
+                self._task_state.workflow_run_id = workflow_run.id
                 response = {
                     'event': 'workflow_started',
                     'task_id': self._application_generate_entity.task_id,
@@ -231,36 +235,39 @@ class AdvancedChatAppGenerateTaskPipeline:
 
                 yield self._yield_response(response)
             elif isinstance(event, QueueStopEvent | QueueWorkflowFinishedEvent):
-                if isinstance(event, QueueWorkflowFinishedEvent):
+                if isinstance(event, QueueStopEvent):
+                    workflow_run = self._get_workflow_run(self._task_state.workflow_run_id)
+                else:
                     workflow_run = self._get_workflow_run(event.workflow_run_id)
-                    if workflow_run.status == WorkflowRunStatus.SUCCEEDED.value:
-                        outputs = workflow_run.outputs
-                        self._task_state.answer = outputs.get('text', '')
-                    else:
-                        err_event = QueueErrorEvent(error=ValueError(f'Run failed: {workflow_run.error}'))
-                        data = self._error_to_stream_response_data(self._handle_error(err_event))
-                        yield self._yield_response(data)
-                        break
 
-                    workflow_run_response = {
-                        'event': 'workflow_finished',
-                        'task_id': self._application_generate_entity.task_id,
-                        'workflow_run_id': event.workflow_run_id,
-                        'data': {
-                            'id': workflow_run.id,
-                            'workflow_id': workflow_run.workflow_id,
-                            'status': workflow_run.status,
-                            'outputs': workflow_run.outputs_dict,
-                            'error': workflow_run.error,
-                            'elapsed_time': workflow_run.elapsed_time,
-                            'total_tokens': workflow_run.total_tokens,
-                            'total_steps': workflow_run.total_steps,
-                            'created_at': int(workflow_run.created_at.timestamp()),
-                            'finished_at': int(workflow_run.finished_at.timestamp())
-                        }
+                if workflow_run.status == WorkflowRunStatus.SUCCEEDED.value:
+                    outputs = workflow_run.outputs_dict
+                    self._task_state.answer = outputs.get('text', '')
+                else:
+                    err_event = QueueErrorEvent(error=ValueError(f'Run failed: {workflow_run.error}'))
+                    data = self._error_to_stream_response_data(self._handle_error(err_event))
+                    yield self._yield_response(data)
+                    break
+
+                workflow_run_response = {
+                    'event': 'workflow_finished',
+                    'task_id': self._application_generate_entity.task_id,
+                    'workflow_run_id': event.workflow_run_id,
+                    'data': {
+                        'id': workflow_run.id,
+                        'workflow_id': workflow_run.workflow_id,
+                        'status': workflow_run.status,
+                        'outputs': workflow_run.outputs_dict,
+                        'error': workflow_run.error,
+                        'elapsed_time': workflow_run.elapsed_time,
+                        'total_tokens': workflow_run.total_tokens,
+                        'total_steps': workflow_run.total_steps,
+                        'created_at': int(workflow_run.created_at.timestamp()),
+                        'finished_at': int(workflow_run.finished_at.timestamp())
                     }
+                }
 
-                    yield self._yield_response(workflow_run_response)
+                yield self._yield_response(workflow_run_response)
 
                 # response moderation
                 if self._output_moderation_handler:
@@ -342,7 +349,7 @@ class AdvancedChatAppGenerateTaskPipeline:
 
                     yield self._yield_response(response)
             elif isinstance(event, QueueTextChunkEvent):
-                delta_text = event.chunk_text
+                delta_text = event.text
                 if delta_text is None:
                     continue
 
@@ -389,7 +396,13 @@ class AdvancedChatAppGenerateTaskPipeline:
         :param workflow_run_id: workflow run id
         :return:
         """
-        return db.session.query(WorkflowRun).filter(WorkflowRun.id == workflow_run_id).first()
+        workflow_run = db.session.query(WorkflowRun).filter(WorkflowRun.id == workflow_run_id).first()
+        if workflow_run:
+            # Because the workflow_run will be modified in the sub-thread,
+            # and the first query in the main thread will cache the entity,
+            # you need to expire the entity after the query
+            db.session.expire(workflow_run)
+        return workflow_run
 
     def _get_workflow_node_execution(self, workflow_node_execution_id: str) -> WorkflowNodeExecution:
         """
@@ -397,7 +410,14 @@ class AdvancedChatAppGenerateTaskPipeline:
         :param workflow_node_execution_id: workflow node execution id
         :return:
         """
-        return db.session.query(WorkflowNodeExecution).filter(WorkflowNodeExecution.id == workflow_node_execution_id).first()
+        workflow_node_execution = (db.session.query(WorkflowNodeExecution)
+                                   .filter(WorkflowNodeExecution.id == workflow_node_execution_id).first())
+        if workflow_node_execution:
+            # Because the workflow_node_execution will be modified in the sub-thread,
+            # and the first query in the main thread will cache the entity,
+            # you need to expire the entity after the query
+            db.session.expire(workflow_node_execution)
+        return workflow_node_execution
 
     def _save_message(self) -> None:
         """
@@ -408,6 +428,7 @@ class AdvancedChatAppGenerateTaskPipeline:
 
         self._message.answer = self._task_state.answer
         self._message.provider_response_latency = time.perf_counter() - self._start_at
+        self._message.workflow_run_id = self._task_state.workflow_run_id
 
         if self._task_state.metadata and self._task_state.metadata.get('usage'):
             usage = LLMUsage(**self._task_state.metadata['usage'])
