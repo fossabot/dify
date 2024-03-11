@@ -202,6 +202,8 @@ class ChatAppRunner(AppRunner):
             model=application_generate_entity.model_config.model
         )
 
+        db.session.close()
+
         invoke_result = model_instance.invoke_llm(
             prompt_messages=prompt_messages,
             model_parameters=application_generate_entity.model_config.parameters,

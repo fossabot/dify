@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Optional
 
 from core.workflow.callbacks.base_workflow_callback import BaseWorkflowCallback
@@ -8,9 +9,35 @@ from core.workflow.entities.variable_pool import VariablePool
 from models.workflow import WorkflowNodeExecutionStatus
 
 
+class UserFrom(Enum):
+    """
+    User from
+    """
+    ACCOUNT = "account"
+    END_USER = "end-user"
+
+    @classmethod
+    def value_of(cls, value: str) -> "UserFrom":
+        """
+        Value of
+        :param value: value
+        :return:
+        """
+        for item in cls:
+            if item.value == value:
+                return item
+        raise ValueError(f"Invalid value: {value}")
+
+
 class BaseNode(ABC):
     _node_data_cls: type[BaseNodeData]
     _node_type: NodeType
+
+    tenant_id: str
+    app_id: str
+    workflow_id: str
+    user_id: str
+    user_from: UserFrom
 
     node_id: str
     node_data: BaseNodeData
@@ -18,8 +45,19 @@ class BaseNode(ABC):
 
     callbacks: list[BaseWorkflowCallback]
 
-    def __init__(self, config: dict,
+    def __init__(self, tenant_id: str,
+                 app_id: str,
+                 workflow_id: str,
+                 user_id: str,
+                 user_from: UserFrom,
+                 config: dict,
                  callbacks: list[BaseWorkflowCallback] = None) -> None:
+        self.tenant_id = tenant_id
+        self.app_id = app_id
+        self.workflow_id = workflow_id
+        self.user_id = user_id
+        self.user_from = user_from
+
         self.node_id = config.get("id")
         if not self.node_id:
             raise ValueError("Node ID is required.")
@@ -28,31 +66,23 @@ class BaseNode(ABC):
         self.callbacks = callbacks or []
 
     @abstractmethod
-    def _run(self, variable_pool: Optional[VariablePool] = None,
-             run_args: Optional[dict] = None) -> NodeRunResult:
+    def _run(self, variable_pool: VariablePool) -> NodeRunResult:
         """
         Run node
         :param variable_pool: variable pool
-        :param run_args: run args
         :return:
         """
         raise NotImplementedError
 
-    def run(self, variable_pool: Optional[VariablePool] = None,
-            run_args: Optional[dict] = None) -> NodeRunResult:
+    def run(self, variable_pool: VariablePool) -> NodeRunResult:
         """
         Run node entry
         :param variable_pool: variable pool
-        :param run_args: run args
         :return:
         """
-        if variable_pool is None and run_args is None:
-            raise ValueError("At least one of `variable_pool` or `run_args` must be provided.")
-
         try:
             result = self._run(
-                variable_pool=variable_pool,
-                run_args=run_args
+                variable_pool=variable_pool
             )
         except Exception as e:
             # process unhandled exception
@@ -76,6 +106,26 @@ class BaseNode(ABC):
                     node_id=self.node_id,
                     text=text
                 )
+
+    @classmethod
+    def extract_variable_selector_to_variable_mapping(cls, config: dict) -> dict:
+        """
+        Extract variable selector to variable mapping
+        :param config: node config
+        :return:
+        """
+        node_data = cls._node_data_cls(**config.get("data", {}))
+        return cls._extract_variable_selector_to_variable_mapping(node_data)
+
+    @classmethod
+    @abstractmethod
+    def _extract_variable_selector_to_variable_mapping(cls, node_data: BaseNodeData) -> dict[list[str], str]:
+        """
+        Extract variable selector to variable mapping
+        :param node_data: node data
+        :return:
+        """
+        raise NotImplementedError
 
     @classmethod
     def get_default_config(cls, filters: Optional[dict] = None) -> dict:
