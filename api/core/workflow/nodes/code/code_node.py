@@ -153,11 +153,13 @@ class CodeNode(BaseNode):
             raise ValueError(f'{variable} in input form is out of range.')
 
         if isinstance(value, float):
-            value = round(value, MAX_PRECISION)
+            # raise error if precision is too high
+            if len(str(value).split('.')[1]) > MAX_PRECISION:
+                raise ValueError(f'{variable} in output form has too high precision.')
 
         return value
 
-    def _transform_result(self, result: dict, output_schema: dict[str, CodeNodeData.Output],
+    def _transform_result(self, result: dict, output_schema: Optional[dict[str, CodeNodeData.Output]],
                           prefix: str = '',
                           depth: int = 1) -> dict:
         """
@@ -170,6 +172,47 @@ class CodeNode(BaseNode):
             raise ValueError("Depth limit reached, object too deep.")
 
         transformed_result = {}
+        if output_schema is None:
+            # validate output thought instance type
+            for output_name, output_value in result.items():
+                if isinstance(output_value, dict):
+                    self._transform_result(
+                        result=output_value,
+                        output_schema=None,
+                        prefix=f'{prefix}.{output_name}' if prefix else output_name,
+                        depth=depth + 1
+                    )
+                elif isinstance(output_value, int | float):
+                    self._check_number(
+                        value=output_value,
+                        variable=f'{prefix}.{output_name}' if prefix else output_name
+                    )
+                elif isinstance(output_value, str):
+                    self._check_string(
+                        value=output_value,
+                        variable=f'{prefix}.{output_name}' if prefix else output_name
+                    )
+                elif isinstance(output_value, list):
+                    if all(isinstance(value, int | float) for value in output_value):
+                        for value in output_value:
+                            self._check_number(
+                                value=value,
+                                variable=f'{prefix}.{output_name}' if prefix else output_name
+                            )
+                    elif all(isinstance(value, str) for value in output_value):
+                        for value in output_value:
+                            self._check_string(
+                                value=value,
+                                variable=f'{prefix}.{output_name}' if prefix else output_name
+                            )
+                    else:
+                        raise ValueError(f'Output {prefix}.{output_name} is not a valid array. make sure all elements are of the same type.')
+                else:
+                    raise ValueError(f'Output {prefix}.{output_name} is not a valid type.')
+                
+            return result
+
+        parameters_validated = {}
         for output_name, output_config in output_schema.items():
             if output_config.type == 'object':
                 # check if output is object
@@ -236,11 +279,17 @@ class CodeNode(BaseNode):
                 ]
             else:
                 raise ValueError(f'Output type {output_config.type} is not supported.')
+            
+            parameters_validated[output_name] = True
+
+        # check if all output parameters are validated
+        if len(parameters_validated) != len(result):
+            raise ValueError('Not all output parameters are validated.')
 
         return transformed_result
 
     @classmethod
-    def _extract_variable_selector_to_variable_mapping(cls, node_data: CodeNodeData) -> dict[list[str], str]:
+    def _extract_variable_selector_to_variable_mapping(cls, node_data: CodeNodeData) -> dict[str, list[str]]:
         """
         Extract variable selector to variable mapping
         :param node_data: node data
@@ -248,5 +297,5 @@ class CodeNode(BaseNode):
         """
 
         return {
-            variable_selector.value_selector: variable_selector.variable for variable_selector in node_data.variables
+            variable_selector.variable: variable_selector.value_selector for variable_selector in node_data.variables
         }

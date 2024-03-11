@@ -42,7 +42,7 @@ class ToolNode(BaseNode):
 
         try:
             # TODO: user_id
-            messages = tool_runtime.invoke(None, parameters)
+            messages = tool_runtime.invoke(self.user_id, parameters)
         except Exception as e:
             return NodeRunResult(
                 status=WorkflowNodeExecutionStatus.FAILED,
@@ -133,8 +133,12 @@ class ToolNode(BaseNode):
 
 
     @classmethod
-    def _extract_variable_selector_to_variable_mapping(cls, node_data: BaseNodeData) -> dict[list[str], str]:
+    def _extract_variable_selector_to_variable_mapping(cls, node_data: BaseNodeData) -> dict[str, list[str]]:
         """
         Extract variable selector to variable mapping
         """
-        pass
+        return {
+            k.variable: k.value_selector
+            for k in cast(ToolNodeData, node_data).tool_parameters
+            if k.variable_type == 'selector'
+        }
